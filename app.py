@@ -13,7 +13,7 @@ from utils.io import read_any_table, read_raw_noheader
 from utils.rules import load_rules_xlsx, match_categories, Rule
 from utils.transform import build_fact_tables
 
-st.set_page_config(page_title="餐饮经营分析系统", layout="wide")
+st.set_page_config(page_title="正大餐饮经营分析系统_临时", layout="wide")
 
 
 @dataclass
@@ -121,6 +121,210 @@ def fmt_money(x: float) -> str:
     except Exception:
         return "—"
 
+def _safe_div(a: float, b: float) -> float:
+    return float(a) / float(b) if b not in (0, 0.0, None) else 0.0
+
+
+def _dist_from_group(df: pd.DataFrame, key: str, value: str, topn: int = 20) -> Tuple[List[str], np.ndarray]:
+    if df is None or df.empty or key not in df.columns or value not in df.columns:
+        return [], np.array([], dtype=float)
+    g = df.groupby(key, as_index=False)[value].sum().sort_values(value, ascending=False)
+    if topn and topn > 0:
+        g = g.head(topn)
+    return g[key].astype(str).tolist(), g[value].astype(float).to_numpy()
+
+
+def _align_two(keys_a: List[str], vals_a: np.ndarray, keys_b: List[str], vals_b: np.ndarray) -> Tuple[List[str], np.ndarray, np.ndarray]:
+    keys = list(dict.fromkeys(list(keys_a) + list(keys_b)))
+    ma = {k: float(v) for k, v in zip(keys_a, vals_a)}
+    mb = {k: float(v) for k, v in zip(keys_b, vals_b)}
+    a = np.array([ma.get(k, 0.0) for k in keys], dtype=float)
+    b = np.array([mb.get(k, 0.0) for k in keys], dtype=float)
+    return keys, a, b
+
+
+def _entropy_share(v: np.ndarray) -> float:
+    v = np.asarray(v, dtype=float)
+    s = float(np.sum(v))
+    if s <= 0:
+        return 0.0
+    p = v / s
+    p = np.where(p <= 0, 1e-12, p)
+    h = float(-np.sum(p * np.log(p)))
+    hmax = float(np.log(len(p))) if len(p) > 1 else 1.0
+    return h / hmax if hmax > 0 else 0.0
+
+
+def _max_share(v: np.ndarray) -> float:
+    s = float(np.sum(v))
+    if s <= 0:
+        return 0.0
+    return float(np.max(v / s))
+
+
+def _compute_profile_scores(filtered_store: Dict[str, pd.DataFrame]) -> Dict[str, float]:
+    o = filtered_store["orders"]
+    p = filtered_store["pay"]
+    m = filtered_store["items_main"]
+    a = filtered_store["items_add"]
+
+    orders = int(o["POS销售单号"].nunique()) if o is not None and not o.empty else 0
+    net = float(o["net_amount"].sum()) if o is not None and not o.empty else 0.0
+    paid = float(p["总金额"].sum()) if p is not None and not p.empty else 0.0
+    aov = _safe_div(net, orders)
+    refund_rate = float(o["has_refund"].mean()) if (o is not None and not o.empty and "has_refund" in o.columns) else 0.0
+    diff_abs_rate = _safe_div(abs(net - paid), max(net, 1e-9))
+
+    add_orders = int(a["order_id"].nunique()) if a is not None and not a.empty else 0
+    add_rate = _safe_div(add_orders, orders)
+    add_amt = float(a["amount"].sum()) if a is not None and not a.empty else 0.0
+    add_amt_share = _safe_div(add_amt, max(net, 1e-9))
+
+    spec_df = m[m["spec_norm"].notna()].copy() if (m is not None and not m.empty and "spec_norm" in m.columns) else pd.DataFrame()
+    _, spec_vals = _dist_from_group(spec_df, "spec_norm", "菜品数量", topn=10)
+    spec_entropy = _entropy_share(spec_vals) if len(spec_vals) else 0.0
+
+    _, pay_vals = _dist_from_group(p, "支付类型", "总金额", topn=10) if (p is not None and not p.empty) else ([], np.array([], dtype=float))
+    pay_entropy = _entropy_share(pay_vals) if len(pay_vals) else 0.0
+    pay_max_share = _max_share(pay_vals) if len(pay_vals) else 0.0
+
+    if m is not None and not m.empty and "categories" in m.columns:
+        ex = m.copy().explode("categories")
+        ex["categories"] = ex["categories"].fillna("未分类")
+        cat_keys, cat_vals = _dist_from_group(ex, "categories", "优惠后小计价格", topn=50)
+        if len(cat_vals):
+            g = pd.DataFrame({"k": cat_keys, "v": cat_vals}).sort_values("v", ascending=False)
+            top5 = float(g.head(5)["v"].sum())
+            cat_top5_share = _safe_div(top5, float(g["v"].sum()))
+        else:
+            cat_top5_share = 0.0
+    else:
+        cat_top5_share = 0.0
+
+    if o is not None and not o.empty:
+        tmp = o.copy()
+        tmp["slot"] = tmp["order_time"].dt.floor("30min").dt.strftime("%H:%M")
+        s = tmp.groupby("slot", as_index=False).agg(v=("POS销售单号", "nunique")).sort_values("v", ascending=False)
+        top3 = float(s.head(3)["v"].sum())
+        peak3_share = _safe_div(top3, float(s["v"].sum()))
+    else:
+        peak3_share = 0.0
+
+    return {
+        "订单数": orders,
+        "应收": net,
+        "实收": paid,
+        "客单": aov,
+        "退款率": refund_rate,
+        "对账差异率": diff_abs_rate,
+        "单加渗透率": add_rate,
+        "单加金额占比": add_amt_share,
+        "规格多样性": spec_entropy,
+        "渠道多样性": pay_entropy,
+        "渠道最大占比": pay_max_share,
+        "品类Top5占比": cat_top5_share,
+        "峰值Top3占比": peak3_share,
+    }
+
+
+def _radar_df(scores: Dict[str, float], dims: List[str], normalize_max: Dict[str, float], invert: set) -> pd.DataFrame:
+    rows = []
+    for d in dims:
+        v = float(scores.get(d, 0.0))
+        mx = float(normalize_max.get(d, 1.0)) if normalize_max.get(d, 1.0) else 1.0
+        x = v / mx if mx > 0 else 0.0
+        x = max(0.0, min(1.0, x))
+        if d in invert:
+            x = 1.0 - x
+        rows.append({"维度": d, "得分": x})
+    return pd.DataFrame(rows)
+
+
+def _radar_chart(df: pd.DataFrame, store_col: str = "门店") -> alt.Chart:
+    """Radar chart (matplotlib-free) with strong visibility in Streamlit/Altair v6."""
+    dims = df["维度"].unique().tolist()
+    n = len(dims)
+    if n == 0:
+        return alt.Chart(pd.DataFrame({"x": [0], "y": [0]})).mark_point().encode(x="x", y="y")
+
+    angle_map = {d: i * 2 * np.pi / n for i, d in enumerate(dims)}
+    d2 = df.copy()
+    d2["angle"] = d2["维度"].map(angle_map).astype(float)
+
+    # Ensure score is finite
+    d2["得分"] = pd.to_numeric(d2["得分"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+
+    d2["x"] = d2["得分"] * np.cos(d2["angle"])
+    d2["y"] = d2["得分"] * np.sin(d2["angle"])
+
+    # Close polygon per store
+    closed = []
+    for s, g in d2.groupby(store_col):
+        g = g.sort_values("angle")
+        g2 = pd.concat([g, g.iloc[[0]]], ignore_index=True)
+        closed.append(g2)
+    d2c = pd.concat(closed, ignore_index=True)
+
+    # Fixed domain so it never auto-zooms to zero
+    enc = dict(
+        x=alt.X("x:Q", axis=None, scale=alt.Scale(domain=[-1.15, 1.15])),
+        y=alt.Y("y:Q", axis=None, scale=alt.Scale(domain=[-1.15, 1.15])),
+        color=alt.Color(f"{store_col}:N", legend=alt.Legend(title="门店")),
+        tooltip=[store_col, "维度", alt.Tooltip("得分:Q", format=".2f")],
+    )
+
+    base = alt.Chart(d2c).encode(**enc)
+
+    # Grid circles (0.25/0.5/0.75/1.0)
+    rings = pd.DataFrame({"r": [0.25, 0.5, 0.75, 1.0]})
+    theta = np.linspace(0, 2 * np.pi, 241)
+    ring_rows = []
+    for r in rings["r"]:
+        for t in theta:
+            ring_rows.append({"r": float(r), "x": float(r * np.cos(t)), "y": float(r * np.sin(t))})
+    ring_df = pd.DataFrame(ring_rows)
+    ring = alt.Chart(ring_df).mark_line(opacity=0.18, strokeWidth=2).encode(
+        x=alt.X("x:Q", axis=None, scale=alt.Scale(domain=[-1.15, 1.15])),
+        y=alt.Y("y:Q", axis=None, scale=alt.Scale(domain=[-1.15, 1.15])),
+        detail="r:N",
+    )
+
+    # Axes lines + labels
+    axes_rows = []
+    for d, ang in angle_map.items():
+        axes_rows.append({"维度": d, "x": 0.0, "y": 0.0, "x2": float(np.cos(ang)), "y2": float(np.sin(ang))})
+    axes_df = pd.DataFrame(axes_rows)
+    axes = alt.Chart(axes_df).mark_rule(opacity=0.30, strokeWidth=2).encode(
+        x=alt.X("x:Q", axis=None, scale=alt.Scale(domain=[-1.15, 1.15])),
+        y=alt.Y("y:Q", axis=None, scale=alt.Scale(domain=[-1.15, 1.15])),
+        x2="x2:Q",
+        y2="y2:Q",
+    )
+    labels = alt.Chart(axes_df).mark_text(align="left", dx=8, dy=8, fontSize=12).encode(
+        x=alt.X("x2:Q", axis=None, scale=alt.Scale(domain=[-1.15, 1.15])),
+        y=alt.Y("y2:Q", axis=None, scale=alt.Scale(domain=[-1.15, 1.15])),
+        text="维度:N",
+    )
+
+    # Stronger polygon + points
+    poly = base.mark_line(strokeWidth=4).encode(order=alt.Order("angle:Q"))
+    pts = base.mark_point(filled=True, size=140, opacity=0.95)
+
+    return (ring + axes + poly + pts + labels).properties(height=460).configure_view(stroke=None)
+
+
+
+import uuid
+
+def _dl_key(tag: str, sid: str | None = None) -> str:
+    """
+    Generate a runtime-unique key for Streamlit elements (especially inside loops).
+    Using uuid avoids DuplicateElementKey across reruns and repeated blocks.
+    """
+    if sid is None:
+        return f"dl_{tag}_{uuid.uuid4().hex}"
+    return f"dl_{tag}_{sid}_{uuid.uuid4().hex}"
+
 
 def halfhour_options(min_dt: pd.Timestamp, max_dt: pd.Timestamp) -> List[pd.Timestamp]:
     if pd.isna(min_dt) or pd.isna(max_dt):
@@ -161,11 +365,75 @@ def _share_table(df_long: pd.DataFrame, store_col: str, key_col: str, val_col: s
 
 
 def _js_divergence(p: np.ndarray, q: np.ndarray) -> float:
+    """
+    Jensen–Shannon divergence between two non-negative vectors.
+    Returns a non-negative float (0 means identical distributions).
+    """
     p = np.asarray(p, dtype=float)
     q = np.asarray(q, dtype=float)
-    p = p / (p.sum() if p.sum() else 1.0)
-    q = q / (q.sum() if q.sum() else 1.0)
+
+    # Handle empty/zero vectors robustly
+    ps = float(np.nansum(p))
+    qs = float(np.nansum(q))
+    if ps <= 0 and qs <= 0:
+        return 0.0
+    if ps <= 0:
+        p = np.zeros_like(q, dtype=float)
+        ps = 1.0
+    if qs <= 0:
+        q = np.zeros_like(p, dtype=float)
+        qs = 1.0
+
+    p = np.where(np.isfinite(p), p, 0.0) / ps
+    q = np.where(np.isfinite(q), q, 0.0) / qs
     m = 0.5 * (p + q)
+
+    def _kl(x: np.ndarray, y: np.ndarray) -> float:
+        x = np.where(x <= 0, 1e-12, x)
+        y = np.where(y <= 0, 1e-12, y)
+        return float(np.sum(x * np.log(x / y)))
+
+    return 0.5 * _kl(p, m) + 0.5 * _kl(q, m)
+
+def _simple_gradient_styler(df: pd.DataFrame):
+    """
+    Matplotlib-free gradient styler for Streamlit Cloud.
+    pandas Styler.background_gradient requires matplotlib; this does not.
+    """
+    if df is None or df.empty:
+        return df
+
+    vals = df.to_numpy(dtype=float, copy=True)
+    finite = np.isfinite(vals)
+    if not finite.any():
+        return df
+
+    vmin = float(np.nanmin(vals[finite]))
+    vmax = float(np.nanmax(vals[finite]))
+    if vmin == vmax:
+        vmax = vmin + 1.0
+
+    def _color(v):
+        if v is None:
+            return ""
+        try:
+            fv = float(v)
+        except Exception:
+            return ""
+        if np.isnan(fv) or np.isinf(fv):
+            return ""
+        x = (fv - vmin) / (vmax - vmin)
+        x = max(0.0, min(1.0, x))
+        # light -> dark blue
+        r1, g1, b1 = (246, 248, 255)
+        r2, g2, b2 = (30, 98, 211)
+        r = int(r1 + (r2 - r1) * x)
+        g = int(g1 + (g2 - g1) * x)
+        b = int(b1 + (b2 - b1) * x)
+        txt = "#ffffff" if x > 0.55 else "#111111"
+        return f"background-color: rgb({r},{g},{b}); color: {txt};"
+
+    return df.style.applymap(_color)
 
     def _kl(x, y):
         x = np.where(x <= 0, 1e-12, x)
@@ -176,7 +444,7 @@ def _js_divergence(p: np.ndarray, q: np.ndarray) -> float:
 
 
 def main() -> None:
-    st.title("🍽️ 餐饮经营分析系统（连锁视角 · 董事/股东 · 门店店长）")
+    st.title("🍽️ 正大餐饮经营分析系统_临时版")
 
     with st.sidebar:
         st.header("数据输入")
@@ -265,6 +533,7 @@ def main() -> None:
             "⑧ 未分类池（可导出）",
             "⑨ 明细导出",
             "⑩ 时段热力图",
+            "⑪ 门店画像卡（两店对比）",
         ]
     )
 
@@ -537,9 +806,274 @@ def main() -> None:
             st.dataframe(pay, use_container_width=True)
 
     # ⑦ 退款/异常与对账（保持fixed10功能 + 增强已在上面实现）
+    
+
+        if p is not None and not p.empty:
+            pay_kind = p.groupby(["store_id", "POS销售单号"], as_index=False).agg(
+                paid=("总金额", "sum"),
+                k=("支付类型", lambda s: "混合" if s.nunique() > 1 else str(list(s)[0])),
+            )
+            rr = o.merge(pay_kind, on=["store_id", "POS销售单号"], how="left")
+            rr["paid"] = rr["paid"].fillna(0.0)
+            rr["k"] = rr["k"].fillna("未知")
+            rr["diff"] = rr["net_amount"] - rr["paid"]
+
+            byk = rr.groupby("k", as_index=False).agg(
+                订单数=("POS销售单号", "nunique"),
+                应收=("net_amount", "sum"),
+                实收=("paid", "sum"),
+                差异=("diff", "sum"),
+            ).sort_values(["差异", "订单数"], ascending=False)
+            st.markdown("**按支付渠道分解（差异=应收-实收）**")
+            st.dataframe(byk, use_container_width=True)
+            st.bar_chart(byk.set_index("k")[["差异"]])
+
+            rr["slot"] = rr["order_time"].dt.floor("30min")
+            bys = rr.groupby("slot", as_index=False).agg(
+                订单数=("POS销售单号", "nunique"),
+                应收=("net_amount", "sum"),
+                实收=("paid", "sum"),
+                差异=("diff", "sum"),
+            ).sort_values("slot")
+            st.markdown("**按半小时分解（差异趋势）**")
+            st.line_chart(bys.set_index("slot")[["差异", "应收", "实收"]])
+
+        refund_rate = float(o["has_refund"].mean()) if ("has_refund" in o.columns and not o.empty) else 0.0
+        st.metric("退款单占比（菜品表存在POS退款单号）", f"{refund_rate * 100:.1f}%")
+
+        st.markdown("### 退款归因：菜品/时段/渠道/规格/品类（可导出）")
+        items = filtered[sid]["items_main"]
+        ref_rows = items[items["POS退款单号"].notna()].copy() if (items is not None and not items.empty and "POS退款单号" in items.columns) else pd.DataFrame()
+        if ref_rows.empty:
+            st.info("该时间范围内未识别到退款行（POS退款单号 为空）。")
+        else:
+            ref_rows["slot"] = ref_rows["创建时间"].dt.floor("30min")
+
+            top_dish = ref_rows.groupby("菜品名称", as_index=False).agg(
+                退款行数=("菜品名称", "count"),
+                退款应收=("优惠后小计价格", "sum"),
+                退款订单=("POS销售单号", "nunique"),
+            ).sort_values(["退款应收", "退款行数"], ascending=False).head(30)
+            st.markdown("**退款Top菜品（按退款应收）**")
+            st.dataframe(top_dish, use_container_width=True)
+            st.bar_chart(top_dish.set_index("菜品名称")[["退款应收"]])
+
+            top_slot = ref_rows.groupby("slot", as_index=False).agg(
+                退款应收=("优惠后小计价格", "sum"),
+                退款订单=("POS销售单号", "nunique"),
+            ).sort_values("slot")
+            st.markdown("**退款时段趋势（半小时）**")
+            st.line_chart(top_slot.set_index("slot")[["退款应收", "退款订单"]])
+
+            if "spec_norm" in ref_rows.columns:
+                top_spec = ref_rows.groupby("spec_norm", as_index=False).agg(
+                    退款应收=("优惠后小计价格", "sum"),
+                    退款行数=("菜品名称", "count"),
+                ).sort_values("退款应收", ascending=False)
+                st.markdown("**退款按规格**")
+                st.dataframe(top_spec, use_container_width=True)
+
+            if "categories" in ref_rows.columns:
+                ex = ref_rows.copy().explode("categories")
+                ex["categories"] = ex["categories"].fillna("未分类")
+                top_cat = ex.groupby("categories", as_index=False).agg(
+                    退款应收=("优惠后小计价格", "sum"),
+                    退款行数=("菜品名称", "count"),
+                ).sort_values("退款应收", ascending=False).head(30)
+                st.markdown("**退款按品类**")
+                st.dataframe(top_cat, use_container_width=True)
+
+            if p is not None and not p.empty:
+                pay_kind2 = p.groupby(["store_id", "POS销售单号"], as_index=False).agg(
+                    k=("支付类型", lambda s: "混合" if s.nunique() > 1 else str(list(s)[0]))
+                )
+                ref_o = ref_rows[["store_id", "POS销售单号"]].drop_duplicates().merge(
+                    pay_kind2, on=["store_id", "POS销售单号"], how="left"
+                )
+                ref_o["k"] = ref_o["k"].fillna("未知")
+                top_k = ref_o.groupby("k", as_index=False).agg(退款订单=("POS销售单号", "nunique")).sort_values("退款订单", ascending=False)
+                st.markdown("**退款订单按支付渠道（订单口径）**")
+                st.dataframe(top_k, use_container_width=True)
+
+            add_orders = set(filtered[sid]["items_add"]["order_id"].dropna().astype(str).tolist()) if (filtered[sid]["items_add"] is not None and not filtered[sid]["items_add"].empty) else set()
+            refund_orders = set(ref_rows["POS销售单号"].dropna().astype(str).unique().tolist())
+            has_add_rate = (len(refund_orders & add_orders) / len(refund_orders)) if refund_orders else 0.0
+            st.metric("退款订单含单加占比", f"{has_add_rate*100:.1f}%")
+
+            if add_orders and not filtered[sid]["items_add"].empty:
+                a_ref = filtered[sid]["items_add"].copy()
+                a_ref = a_ref[a_ref["order_id"].astype(str).isin(refund_orders)]
+                if not a_ref.empty:
+                    top_add_ref = a_ref.groupby("add_display", as_index=False).agg(
+                        单加金额=("amount", "sum"),
+                        单加订单=("order_id", "nunique"),
+                    ).sort_values("单加金额", ascending=False).head(20)
+                    st.markdown("**退款订单中的单加Top（按单加金额）**")
+                    st.dataframe(top_add_ref, use_container_width=True)
+
+            st.download_button(
+                f"导出退款明细（{sid}）CSV",
+                key=_dl_key("ln696", sid) ,
+                data=ref_rows.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"退款明细_{sid}.csv",
+                mime="text/csv",
+            )
+
+
+
+    # ⑦ 退款/异常与对账
     with tabs[6]:
-        st.subheader("退款/异常与对账：请使用 fixed10 版的完整内容（本版已在上方实现增强块）")
-        st.info("为避免本文件过长重复，这个 tab 的功能已包含在本 app（你看到的是该提示，说明你跑的是旧缓存）。请 Ctrl+F5 强刷或删除 .streamlit/cache 后重启。")
+        st.subheader("退款/异常与对账：抓风险、抓漏损、抓口径问题")
+        st.caption("对账口径：菜品应收（优惠后小计求和） vs 支付实收（支付表金额求和）。支持按渠道/半小时拆分差异，并做退款归因。")
+
+        for sid in sel_stores:
+            st.markdown(f"#### 门店 {sid}")
+            o = filtered[sid]["orders"]
+            p = filtered[sid]["pay"]
+            if o.empty:
+                st.info("无数据")
+                continue
+
+            paid_by_order = (
+                p.groupby(["store_id", "POS销售单号"], as_index=False).agg(paid=("总金额", "sum"))
+                if (p is not None and not p.empty)
+                else pd.DataFrame(columns=["store_id", "POS销售单号", "paid"])
+            )
+            r = o.merge(paid_by_order, on=["store_id", "POS销售单号"], how="left")
+            r["paid"] = r["paid"].fillna(0.0)
+            r["diff"] = r["net_amount"] - r["paid"]
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("订单数", int(r["POS销售单号"].nunique()))
+            c2.metric("应收(优惠后)", fmt_money(float(r["net_amount"].sum())))
+            c3.metric("实收", fmt_money(float(r["paid"].sum())))
+
+            st.markdown("**差异Top订单（应收-实收）**")
+            top_diff = r.sort_values("diff", ascending=False).head(200)
+            st.dataframe(top_diff, use_container_width=True)
+            st.download_button(
+                f"导出差异Top订单（{sid}）CSV",
+                key=_dl_key("ln736", sid) ,
+                data=top_diff.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"对账差异Top_{sid}.csv",
+                mime="text/csv",
+            )
+
+            if p is not None and not p.empty:
+                pay_kind = p.groupby(["store_id", "POS销售单号"], as_index=False).agg(
+                    paid=("总金额", "sum"),
+                    k=("支付类型", lambda s: "混合" if s.nunique() > 1 else str(list(s)[0])),
+                )
+                rr = o.merge(pay_kind, on=["store_id", "POS销售单号"], how="left")
+                rr["paid"] = rr["paid"].fillna(0.0)
+                rr["k"] = rr["k"].fillna("未知")
+                rr["diff"] = rr["net_amount"] - rr["paid"]
+
+                byk = rr.groupby("k", as_index=False).agg(
+                    订单数=("POS销售单号", "nunique"),
+                    应收=("net_amount", "sum"),
+                    实收=("paid", "sum"),
+                    差异=("diff", "sum"),
+                ).sort_values(["差异", "订单数"], ascending=False)
+                st.markdown("**按支付渠道分解（差异=应收-实收）**")
+                st.dataframe(byk, use_container_width=True)
+                st.bar_chart(byk.set_index("k")[["差异"]])
+
+                rr["slot"] = rr["order_time"].dt.floor("30min")
+                bys = rr.groupby("slot", as_index=False).agg(
+                    订单数=("POS销售单号", "nunique"),
+                    应收=("net_amount", "sum"),
+                    实收=("paid", "sum"),
+                    差异=("diff", "sum"),
+                ).sort_values("slot")
+                st.markdown("**按半小时分解（差异趋势）**")
+                st.line_chart(bys.set_index("slot")[["差异", "应收", "实收"]])
+
+            refund_rate = float(o["has_refund"].mean()) if ("has_refund" in o.columns and not o.empty) else 0.0
+            st.metric("退款单占比（菜品表存在POS退款单号）", f"{refund_rate * 100:.1f}%")
+
+            st.markdown("### 退款归因：菜品/时段/渠道/规格/品类（可导出）")
+            items = filtered[sid]["items_main"]
+            ref_rows = (
+                items[items["POS退款单号"].notna()].copy()
+                if (items is not None and not items.empty and "POS退款单号" in items.columns)
+                else pd.DataFrame()
+            )
+            if ref_rows.empty:
+                st.info("该时间范围内未识别到退款行（POS退款单号 为空）。")
+                continue
+
+            ref_rows["slot"] = ref_rows["创建时间"].dt.floor("30min")
+
+            top_dish = ref_rows.groupby("菜品名称", as_index=False).agg(
+                退款行数=("菜品名称", "count"),
+                退款应收=("优惠后小计价格", "sum"),
+                退款订单=("POS销售单号", "nunique"),
+            ).sort_values(["退款应收", "退款行数"], ascending=False).head(30)
+            st.markdown("**退款Top菜品（按退款应收）**")
+            st.dataframe(top_dish, use_container_width=True)
+            st.bar_chart(top_dish.set_index("菜品名称")[["退款应收"]])
+
+            top_slot = ref_rows.groupby("slot", as_index=False).agg(
+                退款应收=("优惠后小计价格", "sum"),
+                退款订单=("POS销售单号", "nunique"),
+            ).sort_values("slot")
+            st.markdown("**退款时段趋势（半小时）**")
+            st.line_chart(top_slot.set_index("slot")[["退款应收", "退款订单"]])
+
+            if "spec_norm" in ref_rows.columns:
+                top_spec = ref_rows.groupby("spec_norm", as_index=False).agg(
+                    退款应收=("优惠后小计价格", "sum"),
+                    退款行数=("菜品名称", "count"),
+                ).sort_values("退款应收", ascending=False)
+                st.markdown("**退款按规格**")
+                st.dataframe(top_spec, use_container_width=True)
+
+            if "categories" in ref_rows.columns:
+                ex = ref_rows.copy().explode("categories")
+                ex["categories"] = ex["categories"].fillna("未分类")
+                top_cat = ex.groupby("categories", as_index=False).agg(
+                    退款应收=("优惠后小计价格", "sum"),
+                    退款行数=("菜品名称", "count"),
+                ).sort_values("退款应收", ascending=False).head(30)
+                st.markdown("**退款按品类**")
+                st.dataframe(top_cat, use_container_width=True)
+
+            if p is not None and not p.empty:
+                pay_kind2 = p.groupby(["store_id", "POS销售单号"], as_index=False).agg(
+                    k=("支付类型", lambda s: "混合" if s.nunique() > 1 else str(list(s)[0]))
+                )
+                ref_o = ref_rows[["store_id", "POS销售单号"]].drop_duplicates().merge(
+                    pay_kind2, on=["store_id", "POS销售单号"], how="left"
+                )
+                ref_o["k"] = ref_o["k"].fillna("未知")
+                top_k = ref_o.groupby("k", as_index=False).agg(退款订单=("POS销售单号", "nunique")).sort_values("退款订单", ascending=False)
+                st.markdown("**退款订单按支付渠道（订单口径）**")
+                st.dataframe(top_k, use_container_width=True)
+
+            add_orders = set(filtered[sid]["items_add"]["order_id"].dropna().astype(str).tolist()) if (filtered[sid]["items_add"] is not None and not filtered[sid]["items_add"].empty) else set()
+            refund_orders = set(ref_rows["POS销售单号"].dropna().astype(str).unique().tolist())
+            has_add_rate = (len(refund_orders & add_orders) / len(refund_orders)) if refund_orders else 0.0
+            st.metric("退款订单含单加占比", f"{has_add_rate*100:.1f}%")
+
+            if add_orders and not filtered[sid]["items_add"].empty:
+                a_ref = filtered[sid]["items_add"].copy()
+                a_ref = a_ref[a_ref["order_id"].astype(str).isin(refund_orders)]
+                if not a_ref.empty:
+                    top_add_ref = a_ref.groupby("add_display", as_index=False).agg(
+                        单加金额=("amount", "sum"),
+                        单加订单=("order_id", "nunique"),
+                    ).sort_values("单加金额", ascending=False).head(20)
+                    st.markdown("**退款订单中的单加Top（按单加金额）**")
+                    st.dataframe(top_add_ref, use_container_width=True)
+
+            st.download_button(
+                f"导出退款明细（{sid}）CSV",
+                key=_dl_key("ln852", sid) ,
+                data=ref_rows.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"退款明细_{sid}.csv",
+                mime="text/csv",
+            )
 
     # ⑧ 未分类池
     with tabs[7]:
@@ -553,6 +1087,7 @@ def main() -> None:
             un = m[m["categories"].apply(lambda x: len(x) == 0)].copy()
             st.write(f"未分类主菜行数：{len(un):,}")
             st.dataframe(un.head(200), use_container_width=True)
+            key=_dl_key("ln872", sid) ,
             st.download_button(f"导出未分类主菜（{sid}）CSV", data=un.to_csv(index=False).encode("utf-8-sig"), file_name=f"未分类主菜_{sid}.csv", mime="text/csv")
 
     # ⑨ 明细导出
@@ -561,6 +1096,7 @@ def main() -> None:
         for sid in sel_stores:
             st.markdown(f"#### 门店 {sid}")
             m = filtered[sid]["items_main"]
+            key=_dl_key("ln880", sid) ,
             st.download_button(f"导出菜品明细-过滤后（{sid}）CSV", data=m.to_csv(index=False).encode("utf-8-sig"), file_name=f"菜品明细_过滤后_{sid}.csv", mime="text/csv")
 
     # ⑩ 时段热力图（动作建议+导出）
@@ -615,7 +1151,7 @@ def main() -> None:
 
             view = st.radio("展示方式", options=["热力图", "渐变表格"], horizontal=True, key=f"heat_view_{key_prefix}_{metric}")
             if view == "渐变表格":
-                st.dataframe(mat.style.background_gradient(axis=None), use_container_width=True)
+                st.dataframe(_simple_gradient_styler(mat), use_container_width=True)
             else:
                 mdf = mat.reset_index().melt(id_vars="date", var_name="slot", value_name="value")
                 chart = alt.Chart(mdf).mark_rect().encode(
@@ -644,6 +1180,7 @@ def main() -> None:
 
                 st.dataframe(pd.concat([peak.assign(类型="峰值"), low.assign(类型="低谷"), opp.assign(类型="单加机会")], ignore_index=True), use_container_width=True)
                 action = pd.concat([peak.assign(建议="峰值：加人/备货/保出餐"), low.assign(建议="低谷：促销/团购/引导单加"), opp.assign(建议="机会：强化单加话术")], ignore_index=True)
+                key=_dl_key("ln963", sid) ,
                 st.download_button("导出店长行动清单 CSV", data=action.to_csv(index=False).encode("utf-8-sig"), file_name="店长行动清单.csv", mime="text/csv")
             else:
                 st.info("动作建议：当前范围无足够数据。")
@@ -652,6 +1189,194 @@ def main() -> None:
                 st.markdown(f"#### 门店 {sid}")
                 dfh = _build_heat(filtered[sid]["orders"], filtered[sid]["pay"], filtered[sid]["items_add"])
                 _render_heat(dfh, sid)
+
+    # ⑪ 门店画像卡（两店对比）
+    with tabs[10]:
+        st.subheader("门店画像卡（两店对比）：一页判断“像谁 / 偏在哪 / 怎么改”")
+        st.caption("选择两家门店进行对比：KPI对照 + 雷达图（能力结构）+ 偏离度拆解（规格/单加/支付/品类/时段）+ 行动建议。")
+
+        if len(sel_stores) < 2:
+            st.info("请在顶部“选择门店”中至少选择 2 家门店，才能进行两店对比。")
+        else:
+            c1, c2, c3 = st.columns([2, 2, 2])
+            with c1:
+                store_a = st.selectbox("门店A", options=sel_stores, index=0, key="portrait_a")
+            with c2:
+                opts_b = [s for s in sel_stores if s != store_a] or sel_stores
+                store_b = st.selectbox("门店B", options=opts_b, index=0, key="portrait_b")
+            with c3:
+                bench_mode = st.selectbox("基准", options=["两店均值", "以门店A为标杆", "以门店B为标杆"], index=0, key="portrait_bench")
+
+            fa = filtered[store_a]
+            fb = filtered[store_b]
+
+            sa = _compute_profile_scores(fa)
+            sb = _compute_profile_scores(fb)
+
+            kpi_cols = ["订单数", "应收", "实收", "客单", "退款率", "对账差异率", "单加渗透率", "单加金额占比", "规格多样性", "渠道多样性", "渠道最大占比", "品类Top5占比", "峰值Top3占比"]
+            kpidf = pd.DataFrame({"指标": kpi_cols, store_a: [sa.get(k) for k in kpi_cols], store_b: [sb.get(k) for k in kpi_cols]})
+            st.dataframe(kpidf, use_container_width=True)
+
+            radar_dims = ["客单", "单加渗透率", "规格多样性", "渠道多样性", "品类Top5占比", "峰值Top3占比", "退款率", "对账差异率"]
+            invert = {"品类Top5占比", "峰值Top3占比", "退款率", "对账差异率"}
+            # 用“本次筛选门店的分布”做归一化，避免两店互相当标尺导致雷达图失真
+            profiles = {}
+            for _sid in sel_stores:
+                try:
+                    profiles[_sid] = _compute_profile_scores(filtered[_sid])
+                except Exception:
+                    profiles[_sid] = {}
+
+            normalize_max = {}
+            for d in radar_dims:
+                vals = [float(profiles.get(_sid, {}).get(d, 0.0) or 0.0) for _sid in sel_stores]
+                mx = float(np.nanpercentile(vals, 95)) if len(vals) else 1.0
+                normalize_max[d] = max(mx, 1e-9)
+
+
+            dfa = _radar_df(sa, radar_dims, normalize_max, invert); dfa["门店"] = store_a
+            dfb = _radar_df(sb, radar_dims, normalize_max, invert); dfb["门店"] = store_b
+            rdf = pd.concat([dfa, dfb], ignore_index=True)
+
+            st.markdown("### 能力结构雷达图（0-1）：越外圈越强")
+            st.altair_chart(_radar_chart(rdf, store_col="门店"), use_container_width=True)
+
+            st.markdown("### 偏离度拆解（JS divergence）：告诉你“偏在哪”")
+
+            def bench_dist(keys_a, vals_a, keys_b, vals_b):
+                _, a, b = _align_two(keys_a, vals_a, keys_b, vals_b)
+                if bench_mode == "以门店A为标杆":
+                    q = a
+                elif bench_mode == "以门店B为标杆":
+                    q = b
+                else:
+                    q = 0.5 * (a + b)
+                return a, b, q
+
+            ma = _base_items(fa["items_main"]); mb = _base_items(fb["items_main"])
+            spec_a = ma[ma["spec_norm"].notna()] if (ma is not None and not ma.empty and "spec_norm" in ma.columns) else pd.DataFrame()
+            spec_b = mb[mb["spec_norm"].notna()] if (mb is not None and not mb.empty and "spec_norm" in mb.columns) else pd.DataFrame()
+            k_sa, v_sa = _dist_from_group(spec_a, "spec_norm", "菜品数量", topn=10)
+            k_sb, v_sb = _dist_from_group(spec_b, "spec_norm", "菜品数量", topn=10)
+            va, vb, q = bench_dist(k_sa, v_sa, k_sb, v_sb)
+            js_spec_a, js_spec_b = _js_divergence(va, q), _js_divergence(vb, q)
+
+            k_aa, v_aa = _dist_from_group(fa["items_add"], "add_display", "amount", topn=15)
+            k_ab, v_ab = _dist_from_group(fb["items_add"], "add_display", "amount", topn=15)
+            va2, vb2, q2 = bench_dist(k_aa, v_aa, k_ab, v_ab)
+            js_add_a, js_add_b = _js_divergence(va2, q2), _js_divergence(vb2, q2)
+
+            k_pa, v_pa = _dist_from_group(fa["pay"], "支付类型", "总金额", topn=15)
+            k_pb, v_pb = _dist_from_group(fb["pay"], "支付类型", "总金额", topn=15)
+            va3, vb3, q3 = bench_dist(k_pa, v_pa, k_pb, v_pb)
+            js_pay_a, js_pay_b = _js_divergence(va3, q3), _js_divergence(vb3, q3)
+
+            def cat_dist(x):
+                if x is None or x.empty or "categories" not in x.columns:
+                    return [], np.array([], dtype=float)
+                ex = x.copy().explode("categories"); ex["categories"] = ex["categories"].fillna("未分类")
+                return _dist_from_group(ex, "categories", "优惠后小计价格", topn=25)
+
+            k_ca, v_ca = cat_dist(fa["items_main"]); k_cb, v_cb = cat_dist(fb["items_main"])
+            va4, vb4, q4 = bench_dist(k_ca, v_ca, k_cb, v_cb)
+            js_cat_a, js_cat_b = _js_divergence(va4, q4), _js_divergence(vb4, q4)
+
+            def slot_dist(o):
+                if o is None or o.empty:
+                    return [], np.array([], dtype=float)
+                t = o.copy()
+                t["slot"] = t["order_time"].dt.floor("30min").dt.strftime("%H:%M")
+                return _dist_from_group(t, "slot", "dish_qty", topn=48)
+
+            k_ta, v_ta = slot_dist(fa["orders"]); k_tb, v_tb = slot_dist(fb["orders"])
+            va5, vb5, q5 = bench_dist(k_ta, v_ta, k_tb, v_tb)
+            js_time_a, js_time_b = _js_divergence(va5, q5), _js_divergence(vb5, q5)
+
+            dims = ["规格", "单加", "支付", "品类", "时段"]
+            js_a = np.array([js_spec_a, js_add_a, js_pay_a, js_cat_a, js_time_a], dtype=float)
+            js_b = np.array([js_spec_b, js_add_b, js_pay_b, js_cat_b, js_time_b], dtype=float)
+
+            suma = float(js_a.sum()) if float(js_a.sum()) > 0 else 1.0
+            sumb = float(js_b.sum()) if float(js_b.sum()) > 0 else 1.0
+
+            div_df = pd.DataFrame({
+                "维度": dims,
+                f"{store_a} 偏离度": js_a,
+                f"{store_a} 贡献": js_a / suma,
+                f"{store_b} 偏离度": js_b,
+                f"{store_b} 贡献": js_b / sumb,
+            })
+            st.dataframe(div_df.style.format({f"{store_a} 偏离度": "{:.4f}", f"{store_b} 偏离度": "{:.4f}", f"{store_a} 贡献": "{:.0%}", f"{store_b} 贡献": "{:.0%}"}), use_container_width=True)
+
+            def top_reason(js_vec: np.ndarray) -> str:
+                if float(js_vec.sum()) <= 0:
+                    return "结构与基准几乎一致"
+                k = int(np.argmax(js_vec))
+                return f"主要偏离来自【{dims[k]}】（贡献 {js_vec[k]/js_vec.sum():.0%}）"
+
+            colx, coly = st.columns(2)
+            with colx:
+                st.markdown(f"**{store_a} 结论：** {top_reason(js_a)}")
+            with coly:
+                st.markdown(f"**{store_b} 结论：** {top_reason(js_b)}")
+
+            st.markdown("### 行动建议")
+            def advice(scores: Dict[str, float], radar_scores: pd.DataFrame) -> List[str]:
+                # 先跑“硬规则”告警，再补“短板Top2”建议，保证每家店都有可执行动作
+                out: List[str] = []
+
+                if scores.get("退款率", 0) > 0.03:
+                    out.append("退款偏高：优先排查 Top退款菜品与对应时段，核查出品稳定性/配送问题/支付对账口径。")
+                if scores.get("对账差异率", 0) > 0.02:
+                    out.append("对账差异偏大：重点看混合支付与团购渠道，排查漏记/退款口径差/跨日支付。")
+                if scores.get("渠道最大占比", 0) > 0.75:
+                    out.append("渠道过度依赖：注意单一渠道波动风险，优化多渠道渗透（团购/小程序/外卖）。")
+
+                weakest = radar_scores.sort_values("得分", ascending=True).head(2)["维度"].tolist()
+                for w in weakest:
+                    if w == "单加渗透率":
+                        out.append("单加偏弱：高峰时段强化“加料话术/提示卡”，重点提升单加-鸡丁/单加-卤蛋等渗透。")
+                    elif w == "规格多样性":
+                        out.append("规格结构偏单一：检查主食结构（细面/宽面/米饭/宽粉/无需主食/套餐标准）是否失衡，尝试用套餐与陈列引导分流。")
+                    elif w == "渠道多样性":
+                        out.append("支付渠道过于单一：检查线上/线下、团购渗透与支付方式覆盖，减少单点波动。")
+                    elif w == "品类Top5占比":
+                        out.append("品类过度集中：检查爆品依赖与缺货风险，用套餐/第二爆品/搭配单加分流。")
+                    elif w == "峰值Top3占比":
+                        out.append("峰值过度集中：在Top3半小时加人/备货；低谷用团购、小套餐、主食组合拉平波动。")
+                    elif w == "客单":
+                        out.append("客单偏低：用套餐标准、单加推荐与高毛利饮品/小食提升客单。")
+                    elif w == "退款率":
+                        out.append("退款偏高：优先看退款热力时段与Top退款菜品，定位流程或渠道问题。")
+                    elif w == "对账差异率":
+                        out.append("对账差异偏大：重点核对支付表与订单表时间口径、跨日支付与退款归属。")
+
+                seen = set()
+                uniq = []
+                for s in out:
+                    if s not in seen:
+                        uniq.append(s); seen.add(s)
+                return uniq[:6] if uniq else ["结构健康：建议作为标杆门店，沉淀可复制打法（菜单结构/单加/渠道/排班）。"]
+
+            a1, a2 = st.columns(2)
+            with a1:
+                st.markdown(f"**{store_a} 建议**")
+                for s in advice(sa, dfa):
+                    st.write("• " + s)
+            with a2:
+                st.markdown(f"**{store_b} 建议**")
+                for s in advice(sb, dfb):
+                    st.write("• " + s)
+
+            st.download_button(
+                "导出画像卡指标对比 CSV",
+                data=kpidf.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"门店画像卡对比_{store_a}_vs_{store_b}.csv",
+                mime="text/csv",
+                key=_dl_key("portrait"),
+            )
+
+
 
 
 if __name__ == "__main__":
